@@ -1,5 +1,7 @@
 const { WebSocketServer, WebSocket } = require("ws");
 const { createServer } = require("http");
+const { generateImage } = require("./imageGenerator");
+const { generateAnswer, translate, generatePrompt } = require("./chatgpt");
 
 const server = createServer((req, res) => {
   // CORSヘッダーを追加
@@ -18,18 +20,26 @@ const server = createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WebSocket server is running.');
 });
-
 const wss = new WebSocketServer({ server });
 
 const lobbies = {};
 const MAX_USERS = 4;
+
+server.on("error", (error) => {
+  console.error("HTTP server error:", error);
+});
+
+wss.on("error", (error) => {
+  console.error("WebSocket server error:", error);
+});
 
 wss.on("connection", (ws) => {
   let currentLobby = null;
   let userNumber = null;
   let userName = null;
 
-  ws.on("message", (message) => {
+  // クライアントからメッセージが送られてきた時に呼ばれる
+  ws.on("message", async (message) => {
     const parsedMessage = JSON.parse(message.toString());
     if (parsedMessage.type === "join") {
       currentLobby = parsedMessage.payload.lobby;
@@ -91,35 +101,90 @@ wss.on("connection", (ws) => {
             JSON.stringify({ type: "gameStarted", payload: true })
           );
         });
+        const initialPrompt = await generatePrompt();
+        lobby.originalMessage = initialPrompt;
+        console.log(initialPrompt);
+        const translatedPrompt = await translate(initialPrompt);
+        console.log(translatedPrompt);
+        const imageData = await generateImage(translatedPrompt);
+        lobby.clients.forEach((client) => {
+          client.ws.send(
+            JSON.stringify({ type: "initialImage", payload: imageData })
+          );
+        });
       }
     } else if (parsedMessage.type === "message" && currentLobby) {
       const lobby = lobbies[currentLobby];
       const currentClient = lobby.clients[lobby.currentTurn];
       if (currentClient.ws === ws) {
         if (lobby.currentTurn === 0) {
-          lobby.originalMessage = parsedMessage.payload;
         }
         lobby.lastMessage = parsedMessage.payload;
 
         lobby.currentTurn = (lobby.currentTurn + 1) % lobby.clients.length;
 
-        if (lobby.currentTurn === 0) {
-          const isCorrect = lobby.lastMessage === lobby.originalMessage;
-          lobby.clients.forEach((client) => {
-            client.ws.send(
+        try {
+          const translatedPrompt = await translate(lobby.lastMessage);
+          const imageData = await generateImage(translatedPrompt);
+
+          if (lobby.currentTurn === 0) {
+            const isCorrect = lobby.lastMessage === lobby.originalMessage;
+            console.log("call chatgpt");
+            const chatgptRes = await generateAnswer(
+              lobby.originalMessage,
+              lobby.lastMessage
+            );
+
+            lobby.clients.forEach(async (client) => {
+              client.ws.send(
+                JSON.stringify({
+                  type: "result",
+                  payload: isCorrect,
+                })
+              );
+              client.ws.send(
+                JSON.stringify({
+                  type: "generatedImage",
+                  payload: imageData,
+                })
+              );
+              client.ws.send(
+                JSON.stringify({
+                  type: "initialPrompt",
+                  payload: lobby.originalMessage,
+                })
+              );
+              client.ws.send(
+                JSON.stringify({
+                  type: "previousMessage",
+                  payload: lobby.lastMessage,
+                })
+              );
+              console.log("chatgptRes//" + chatgptRes);
+              client.ws.send(
+                JSON.stringify({ type: "chatgpt", payload: chatgptRes })
+              );
+            });
+          } else {
+            const nextClient = lobby.clients[lobby.currentTurn];
+            lobby.clients.forEach((client) => {
+              client.ws.send(
+                JSON.stringify({ type: "generatedImage", payload: imageData })
+              );
+            });
+            nextClient.ws.send(JSON.stringify({ type: "turn", payload: true }));
+            nextClient.ws.send(
               JSON.stringify({
-                type: "result",
-                payload: isCorrect,
+                type: "previousMessage",
+                payload: lobby.lastMessage,
               })
             );
-          });
-        } else {
-          const nextClient = lobby.clients[lobby.currentTurn];
-          nextClient.ws.send(JSON.stringify({ type: "turn", payload: true }));
-          nextClient.ws.send(
+          }
+        } catch (error) {
+          ws.send(
             JSON.stringify({
-              type: "previousMessage",
-              payload: lobby.lastMessage,
+              type: "error",
+              payload: "画像の生成に失敗しました。",
             })
           );
           lobby.clients.forEach((client) => {
